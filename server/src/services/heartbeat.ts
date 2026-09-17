@@ -1,3 +1,4 @@
+import { readQueuedInteractionResponse } from "./queued-interaction-response.js";
 import { AGENT_CHAT_DIRECTIVE, conversationReplay, isConversation, isConversationExecutionWake, isWaitingConversation, prepareConversationTurn, settleConversationTurn } from "./agent-conversations.js";
 import { PROCESS_IDENTITY_RECORDED, recordNativeLocalProcessStop } from "./native-local-process-stop.js";
 import { hasAcknowledgedNativeStopIntent, isAcknowledgedNativeStop, acknowledgedNativeStopExecutionHasStopped } from "./acknowledged-native-stop.js";
@@ -29,6 +30,7 @@ export { buildHeartbeatRunStatusLiveEventPayload } from "./heartbeat-run-status-
 import { buildExecutionContinuation } from "./execution-continuation.js";
 import { renderPaperclipWakePrompt } from "@paperclipai/adapter-utils/server-utils";
 import { PROJECT_REPOSITORIES_DIR, readGitWorkspaceSnapshot } from "@paperclipai/adapter-utils/git-workspace-sync";
+import { isWorkspaceGitScanError, WorkspaceGitScanError, WORKSPACE_GIT_SCAN_ERROR_CODES } from "./workspace-git-operation-scheduler.js";
 import { captureDirectorySnapshot, mergeDirectoryWithBaseline } from "@paperclipai/adapter-utils/workspace-restore-merge";
 import { initializeRunIdentity, explicitOperatorRunIdentity } from "./run-identity.js";
 import {
@@ -661,6 +663,8 @@ const PENDING_CLEANUP_SWEEP_ATTEMPT_CAP = 5;
 // The reaper stores its retry state under these keys in the lease metadata.
 const PENDING_CLEANUP_ATTEMPTS_METADATA_KEY = "pendingCleanupRetryAttempts";
 const PENDING_CLEANUP_CAP_WARNED_METADATA_KEY = "pendingCleanupRetryCapWarned";
+// The reaper sweeps at most this many orphaned active leases per tick.
+const ORPHANED_ACTIVE_LEASE_SWEEP_PAGE_SIZE = 20;
 
 // A provider or plugin destroy rejection can carry a bearer credential, a
 // signed URL, or provider response detail in its name, code, message, cause, or
@@ -669,6 +673,7 @@ const PENDING_CLEANUP_CAP_WARNED_METADATA_KEY = "pendingCleanupRetryCapWarned";
 // catch site logs a constant, locally generated `errorKind` instead.
 const PENDING_CLEANUP_RETRY_ERROR_KIND = "destroy_failed";
 const PENDING_CLEANUP_SWEEP_ERROR_KIND = "sweep_failed";
+const ORPHANED_ACTIVE_LEASE_SWEEP_ERROR_KIND = "orphaned_active_lease_sweep_failed";
 
 // Read the stored retry attempt count as a safe value, directly in SQL. A
 // provider can write a malformed value under the attempts key. The type guard
@@ -761,6 +766,9 @@ export const BOUNDED_TRANSIENT_HEARTBEAT_RETRY_DELAYS_MS = [
 const BOUNDED_TRANSIENT_HEARTBEAT_RETRY_JITTER_RATIO = 0;
 const BOUNDED_TRANSIENT_HEARTBEAT_RETRY_REASON = "transient_failure";
 const BOUNDED_TRANSIENT_HEARTBEAT_RETRY_WAKE_REASON = "transient_failure_retry";
+function isTransientWorkspaceGitScanCode(code: string | null | undefined): boolean {
+  return code === WORKSPACE_GIT_SCAN_ERROR_CODES.timeout || code === WORKSPACE_GIT_SCAN_ERROR_CODES.saturated;
+}
 const BOUNDED_TRANSIENT_HEARTBEAT_RETRY_MAX_ATTEMPTS =
   BOUNDED_TRANSIENT_HEARTBEAT_RETRY_DELAYS_MS.length;
 export {
@@ -2496,11 +2504,13 @@ async function materializeManagedProjectWorkspace(
       error: reason,
       used: auth ? { source: auth.source, secretName: auth.secretName } : null,
     });
-    throw new Error(
-      scrubGitCredentialText(
-        `Failed to prepare managed checkout for "${input.repoUrl}" at "${cwd}": ${reason}${authNote ? ` ${authNote}` : ""}`,
-      ),
+    const message = scrubGitCredentialText(
+      `Failed to prepare managed checkout for "${input.repoUrl}" at "${cwd}": ${reason}${authNote ? ` ${authNote}` : ""}`,
     );
+    // Preserve the closed failure code without copying subprocess output or
+    // credentials into the durable run. Setup recovery needs the actual cause.
+    if (isWorkspaceGitScanError(error)) throw new WorkspaceGitScanError(error.code, message);
+    throw new Error(message);
   }
 
   try {
@@ -8563,7 +8573,7 @@ export function buildPaperclipTaskMarkdown(input: {
     lines.push(
       "",
       "External chat file delivery:",
-      "When asked to send an image or file back to this chat, use the bundled Paperclip artifact helper `scripts/paperclip-upload-artifact.sh --chat-comment <caption>` with the local file. Resolve the helper from the installed skill location, not the task workspace. This selects the uploaded file for Paperclip's final-response delivery; an upload or artifact record alone does not. For ordinary file handoffs the helper is the direct path; consult the skill's artifact reference for advanced options, missing tooling, failures, or ambiguous results. Do not search for a separate provider tool connection or fetch a CLI with `npx` to send chat files. Bind only the files the user asked to share, and do not claim provider delivery merely because binding succeeded. GitHub uses task links/notices rather than native file uploads.",
+      "When asked to send an image or file back to this chat, use the bundled Paperclip artifact helper `bash scripts/paperclip-upload-artifact.sh --chat-comment <caption>` with the local file. Resolve the helper from the installed skill location, not the task workspace. This selects the uploaded file for Paperclip's final-response delivery; an upload or artifact record alone does not. For ordinary file handoffs the helper is the direct path; consult the skill's artifact reference for advanced options, missing tooling, failures, or ambiguous results. Do not search for a separate provider tool connection or fetch a CLI with `npx` to send chat files. Bind only the files the user asked to share, and do not claim provider delivery merely because binding succeeded. GitHub uses task links/notices rather than native file uploads.",
       "Prepare and validate the requested files together. Batch independent file preparation and one helper command per file into as few tool calls as practical. Use the same caption for files in one reply so their helper calls share one handoff comment. After a helper reports success, its attachment, artifact, and comment binding are already recorded: do not manually bind the same file again, re-list those records, or add a second handoff comment just to confirm success. Complete the required final-response protocol using the successful receipts. Retry or investigate only a failed or ambiguous step; never repeat a successful upload merely to confirm it.",
     );
   }
@@ -10247,7 +10257,13 @@ export function heartbeatService(
     let actorId = readNonEmptyString(parseObject(payload.queuedCommentInterrupt).actorId);
     let commentIds = queuedCommentIdsFromWakePayload(payload);
     const issueId = readNonEmptyString(payload.issueId);
-    if (!issueId || !commentIds.length || wake.idempotencyKey?.startsWith("chat-inbound:")) return;
+    if (!issueId || wake.idempotencyKey?.startsWith("chat-inbound:")) return;
+    const response = await readQueuedInteractionResponse(db, companyId, issueId, payload);
+    if (!commentIds.length && !response) return;
+    // Resolved cards are immutable input. Only an explicit Interrupt click can
+    // authorize continuation across a stopped execution; ordinary completion
+    // uses normal deferred-wake promotion.
+    if (response && !interrupted) return;
     if (!interrupted) {
       commentIds = await undeliveredLegacyUserCommentIds(db, companyId, issueId, wake.agentId, commentIds);
       if (!commentIds.length) return;
@@ -10263,7 +10279,7 @@ export function heartbeatService(
     }
     if (!actorId) return;
     const agent = await getAgent(wake.agentId);
-    if (!agent || agent.companyId !== companyId || agent.adapterType === "paperclip_runner") return;
+    if (!agent || agent.companyId !== companyId || (agent.adapterType === "paperclip_runner" && !response?.source.requiresFreshSession)) return;
     const [active] = await db.select({ id: heartbeatRuns.id }).from(heartbeatRuns).where(and(
       eq(heartbeatRuns.companyId, companyId),
       eq(heartbeatRuns.agentId, wake.agentId),
@@ -10285,7 +10301,8 @@ export function heartbeatService(
           sql`${agentWakeupRequests.payload}->'queuedCommentInterrupt'->>'actorId' = ${actorId}`,
         ));
         if (!task || task.assigneeAgentId !== wake.agentId || ["done", "cancelled"].includes(task.status) ||
-            !current || !queuedCommentIdsFromWakePayload(current.payload).length) return null;
+            !current || (!queuedCommentIdsFromWakePayload(current.payload).length &&
+              !await readQueuedInteractionResponse(tx as unknown as Db, companyId, issueId, current.payload))) return null;
         const [successor] = await tx.select({ id: heartbeatRuns.id }).from(heartbeatRuns).where(and(
           eq(heartbeatRuns.companyId, companyId),
           eq(heartbeatRuns.agentId, wake.agentId),
@@ -10329,13 +10346,16 @@ export function heartbeatService(
         companyId, runId: sourceRun.id, actorId, reason: "queued_comment_interrupt",
       } });
     }
-    const deliveryPayload = withQueuedCommentIdsInWakePayload(payload, commentIds);
+    const deliveryPayload = response ? { ...payload } : withQueuedCommentIdsInWakePayload(payload, commentIds);
     delete deliveryPayload.queuedCommentInterrupt;
     await enqueueWakeup(wake.agentId, {
       source: "on_demand", triggerDetail: "manual", reason: "issue_commented",
-      payload: deliveryPayload, contextSnapshot: withQueuedCommentIdsInRunContext({
-        issueId, triggeredBy: "board", actorId, responsibleUserId: actorId,
-      }, commentIds),
+      payload: deliveryPayload, contextSnapshot: response
+        ? { ...parseObject(payload._paperclipWakeContext), issueId, triggeredBy: "board", actorId,
+            responsibleUserId: actorId }
+        : withQueuedCommentIdsInRunContext({
+            issueId, triggeredBy: "board", actorId, responsibleUserId: actorId,
+          }, commentIds),
       requestedByActorType: "user", requestedByActorId: actorId,
       ...(interrupted ? { queuedCommentInterruptId: queueId } : { queuedCommentRequestId: queueId }),
       issueStateGuard: { assigneeAgentId: wake.agentId, statuses: ["todo", "in_progress", "in_review", "blocked"] },
@@ -15243,6 +15263,7 @@ export function heartbeatService(
         : baseSchedule;
 
     const requiresIssueGate =
+      isTransientWorkspaceGitScanCode(run.errorCode) ||
       hasConversationContinuationPolicy(run.resultJson) ||
       retryReason === AI_CONNECTION_BUSY_RETRY_REASON ||
       retryReason === MAX_TURN_CONTINUATION_RETRY_REASON ||
@@ -18159,6 +18180,119 @@ export function heartbeatService(
       );
   }
 
+  // Move a guarded orphan candidate to the back of the sweep order. The
+  // shared-resource guard below can skip a row on every tick as long as the
+  // other owner stays live, retained, or pending cleanup. The select orders
+  // by `updatedAt` ascending and takes only the oldest page, so an untouched
+  // skipped row keeps refilling that same page and blocks every row behind
+  // it. The bump pushes the row past the fixed-size page, so the next tick
+  // reaches the rows behind it. It costs the row one extra backoff wait,
+  // which is safe because the guard means a physical sandbox still exists.
+  async function deferOrphanedActiveLease(leaseId: string): Promise<void> {
+    const now = new Date();
+    await db
+      .update(environmentLeases)
+      .set({ updatedAt: now })
+      .where(
+        and(
+          eq(environmentLeases.id, leaseId),
+          eq(environmentLeases.status, "active"),
+        ),
+      );
+  }
+
+  // An active lease is reachable only while its heartbeat run keeps the
+  // running status. The reaper writes the run status and the lease release as
+  // two separate statements, so a restart between them can leave a terminal
+  // run and an active lease. `releaseRunLeases` also skips a lease whose
+  // environment row is gone, so that lease stays active too. No later query
+  // finds either lease, because every production query selects an active
+  // lease by its environment or by its heartbeat run id, never by age. This
+  // sweep finds both stranded classes and moves each lease to pending_cleanup,
+  // so the existing pending_cleanup sweep tears the sandbox down from the
+  // data already on the lease row.
+  async function sweepOrphanedActiveLeases(opts: {
+    backoffMs: number;
+  }): Promise<{ recovered: number }> {
+    const cutoff = new Date(Date.now() - opts.backoffMs);
+
+    const rows = await db
+      .select({ lease: environmentLeases })
+      .from(environmentLeases)
+      .leftJoin(
+        heartbeatRuns,
+        eq(environmentLeases.heartbeatRunId, heartbeatRuns.id),
+      )
+      .where(
+        and(
+          eq(environmentLeases.status, "active"),
+          or(
+            isNull(environmentLeases.heartbeatRunId),
+            inArray(heartbeatRuns.status, [
+              ...HEARTBEAT_RUN_TERMINAL_STATUSES,
+            ]),
+          ),
+          lte(environmentLeases.updatedAt, cutoff),
+        ),
+      )
+      .orderBy(asc(environmentLeases.updatedAt))
+      .limit(ORPHANED_ACTIVE_LEASE_SWEEP_PAGE_SIZE);
+
+    let recovered = 0;
+    for (const { lease } of rows) {
+      // A provider resource id names one physical sandbox. A different lease
+      // row can still hold that same resource in a live status, so this sweep
+      // must not tear down a sandbox that a different lease still owns.
+      if (lease.provider && lease.providerLeaseId) {
+        const [otherOwner] = await db
+          .select({ id: environmentLeases.id })
+          .from(environmentLeases)
+          .where(
+            and(
+              ne(environmentLeases.id, lease.id),
+              eq(environmentLeases.provider, lease.provider),
+              eq(environmentLeases.providerLeaseId, lease.providerLeaseId),
+              inArray(environmentLeases.status, [
+                "active",
+                "retained",
+                "pending_cleanup",
+              ]),
+            ),
+          )
+          .limit(1);
+        if (otherOwner) {
+          // Defer this row so the fixed-size page reaches the rows behind
+          // it next tick, instead of re-selecting the same guarded rows
+          // forever.
+          await deferOrphanedActiveLease(lease.id);
+          continue;
+        }
+      }
+
+      // Keep the row's existing updatedAt value. The select above already
+      // proved the row is older than the backoff cutoff, so the
+      // pending_cleanup sweep can accept the same row in this same tick. A
+      // fresh timestamp here would push the row inside that sweep's own
+      // backoff window and delay the teardown by one full tick.
+      const flipped = await db
+        .update(environmentLeases)
+        .set({
+          status: "pending_cleanup",
+          failureReason: "orphaned_active_lease_recovered",
+        })
+        .where(
+          and(
+            eq(environmentLeases.id, lease.id),
+            eq(environmentLeases.status, "active"),
+          ),
+        )
+        .returning({ id: environmentLeases.id });
+      if (flipped.length > 0) recovered += 1;
+    }
+
+    return { recovered };
+  }
+
   // Retry the leases stranded in "pending_cleanup". A failed destroy leaves a
   // lease in that state forever without this sweep. The reaper tick runs the
   // sweep. The backoff equals the reaper staleness threshold, so a lease waits
@@ -18980,6 +19114,28 @@ export function heartbeatService(
       );
     }
 
+    // Recover an active lease whose run already ended before the same-tick
+    // pending_cleanup sweep, so this tick can stop the recovered sandbox.
+    // Isolate the sweep so its failure never hides the reaper result.
+    try {
+      const orphanedActiveLeaseSweep = await sweepOrphanedActiveLeases({
+        backoffMs: staleThresholdMs,
+      });
+      if (orphanedActiveLeaseSweep.recovered > 0) {
+        logger.warn(
+          { recovered: orphanedActiveLeaseSweep.recovered },
+          "recovered orphaned active environment leases",
+        );
+      }
+    } catch {
+      // Log a constant errorKind only. The exception can carry a credential in
+      // its name, code, message, cause, or stack, so the sweep never reads it.
+      logger.error(
+        { errorKind: ORPHANED_ACTIVE_LEASE_SWEEP_ERROR_KIND },
+        "orphaned active environment lease sweep failed",
+      );
+    }
+
     // Retry stranded pending_cleanup leases on the same tick. Isolate the sweep
     // so its failure never hides the reaper result. The backoff equals the
     // reaper staleness threshold.
@@ -19040,13 +19196,16 @@ export function heartbeatService(
       .innerJoin(companies, and(eq(companies.id, issues.companyId), eq(companies.status, "active")))
       .where(and(eq(agentWakeupRequests.status, "deferred_issue_execution"),
         isNull(issues.executionRunId),
-        sql`jsonb_typeof(${agentWakeupRequests.payload} #> '{_paperclipWakeContext,wakeCommentIds}') = 'array'`,
-        sql`${agentWakeupRequests.payload} #> '{_paperclipWakeContext,wakeCommentIds}' <> '[]'::jsonb`,
+        or(and(
+          sql`jsonb_typeof(${agentWakeupRequests.payload} #> '{_paperclipWakeContext,wakeCommentIds}') = 'array'`,
+          sql`${agentWakeupRequests.payload} #> '{_paperclipWakeContext,wakeCommentIds}' <> '[]'::jsonb`,
+        ), sql`${agentWakeupRequests.payload}->>'mutation' = 'interaction'`),
         sql`${agentWakeupRequests.payload}->'queuedCommentInterrupt' is null`,
         cutoff ? gte(agentWakeupRequests.requestedAt, cutoff) : undefined))
       .orderBy(asc(agentWakeupRequests.updatedAt)).limit(50);
     for (const { wake } of strandedQueues) {
-      if (!queuedCommentIdsFromWakePayload(wake.payload).length) continue;
+      if (!queuedCommentIdsFromWakePayload(wake.payload).length &&
+          !await readQueuedInteractionResponse(db, wake.companyId, String(wake.payload?.issueId), wake.payload)) continue;
       const [latest] = await db.select().from(heartbeatRuns).where(and(
         eq(heartbeatRuns.companyId, wake.companyId), eq(heartbeatRuns.agentId, wake.agentId),
         sql`${heartbeatRuns.contextSnapshot}->>'issueId' = ${String(wake.payload?.issueId)}`,
@@ -25282,7 +25441,9 @@ export function heartbeatService(
           );
         const nonRetryablePreflightCode =
           nonRetryablePreflightFailureCode(outerErr);
+        const workspaceGitScanFailure = isWorkspaceGitScanError(outerErr) ? outerErr : null;
         const setupFailureErrorCode =
+          workspaceGitScanFailure?.code ??
           workspaceValidationSetupFailure?.code ??
           configurationIncompleteSetupFailure?.code ??
           (unresolvedBaseRefSetupFailure ||
@@ -25301,6 +25462,13 @@ export function heartbeatService(
         // action, so it is persisted even when the agent lookup failed and the
         // agent-scoped stop metadata cannot be merged in.
         const setupFailureDetails =
+          (workspaceGitScanFailure ? {
+            workspaceGitScan: {
+              code: workspaceGitScanFailure.code,
+              phase: "workspace_setup",
+              retryable: isTransientWorkspaceGitScanCode(workspaceGitScanFailure.code),
+            },
+          } : null) ??
           workspaceValidationSetupFailure?.resultJson ??
           configurationIncompleteSetupFailure?.resultJson ??
           (unresolvedBaseRefSetupFailure
@@ -25403,9 +25571,12 @@ export function heartbeatService(
                 () => undefined,
               );
             }
-            await scheduleInteractionContinuationInfrastructureRetryIfEligible(
-              livenessRun,
-              failedAgent,
+            // No provider work began. Retry temporary host scan failures with
+            // the existing durable failure budget, before releasing execution.
+            // Generic recovery must not grant a second budget on exhaustion.
+            await (isTransientWorkspaceGitScanCode(livenessRun.errorCode)
+              ? scheduleBoundedRetryForRun(livenessRun, failedAgent)
+              : scheduleInteractionContinuationInfrastructureRetryIfEligible(livenessRun, failedAgent)
             ).catch((retryError) => {
               logger.warn(
                 { err: retryError, runId: livenessRun.id },
@@ -26244,13 +26415,15 @@ export function heartbeatService(
             ));
             // The issue lock serializes cleanup callbacks and periodic workers.
             // An adopted, discarded, or edited receipt is no longer authority.
-            if (!pending || !wakeCommentId || !queuedCommentIdsFromWakePayload(pending.payload).includes(wakeCommentId)) {
+            if (!pending || (!(wakeCommentId && queuedCommentIdsFromWakePayload(pending.payload).includes(wakeCommentId)) &&
+                !(opts.queuedCommentInterruptId && await readQueuedInteractionResponse(tx as unknown as Db,
+                  agent.companyId, issueId, pending.payload)))) {
               return { kind: "deferred" as const };
             }
             if (opts.queuedCommentRequestId) {
               const ids = await undeliveredLegacyUserCommentIds(tx as unknown as Db,
                 agent.companyId, issueId, agentId, queuedCommentIdsFromWakePayload(pending.payload));
-              if (!ids.includes(wakeCommentId)) return { kind: "deferred" as const };
+              if (!wakeCommentId || !ids.includes(wakeCommentId)) return { kind: "deferred" as const };
               pending.payload = withQueuedCommentIdsInWakePayload(parseObject(pending.payload), ids);
               await tx.update(agentWakeupRequests).set({ payload: pending.payload }).where(and(
                 eq(agentWakeupRequests.id, pending.id), eq(agentWakeupRequests.companyId, agent.companyId),
@@ -29014,6 +29187,7 @@ export function heartbeatService(
     reconcileHotRestartAdoption,
     recoverNativeRunsAfterRestart,
     reapOrphanedRuns,
+    sweepOrphanedActiveLeases,
     sweepPendingCleanupLeases,
     // Override-aware scheduling-suppression check (honors the worktree
     // run-execution experimental setting). Callers outside the service that

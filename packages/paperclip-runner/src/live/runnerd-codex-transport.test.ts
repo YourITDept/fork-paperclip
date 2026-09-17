@@ -88,6 +88,7 @@ import {
   unseenRunnerdCommittedEvents,
   unwrapRunnerdProviderNotification,
   unwrapRunnerdProviderNotifications,
+  resolveRunnerdCodexSkillInputs,
   withCodexCollaborationRuntimeInstructions,
 } from "./runnerd-codex-transport.js";
 
@@ -8122,7 +8123,7 @@ it("cold-restores a suspended provider session under its durable run binding", a
       ).mode & 0o222,
     ).toBe(0);
     await first.transport.request("turn/start", {
-      input: [{ type: "text", text: "first process" }],
+      input: [{ type: "text", text: "$assigned first process" }, { type: "skill", name: "assigned", path: join(skillRoot, "SKILL.md") }],
     });
     for await (const event of first.transport.notifications()) {
       if (event.method === "turn/completed") break;
@@ -8166,7 +8167,7 @@ it("cold-restores a suspended provider session under its durable run binding", a
       cwd: tmpdir(),
     });
     await rotated.transport.request("turn/start", {
-      input: [{ type: "text", text: "second authority epoch" }],
+      input: [{ type: "text", text: "$assigned second authority epoch" }, { type: "skill", name: "assigned", path: join(skillRoot, "SKILL.md") }],
     });
     for await (const event of rotated.transport.notifications()) {
       if (event.method === "paperclip/runResult") break;
@@ -8178,7 +8179,7 @@ it("cold-restores a suspended provider session under its durable run binding", a
   } finally {
     await rotated.transport.close();
   }
-  const resumeFrames = (await readFile(tracePath, "utf8"))
+  const requestFrames = (await readFile(tracePath, "utf8"))
     .trim()
     .split("\n")
     .map((line) => JSON.parse(line) as Record<string, unknown>)
@@ -8192,7 +8193,16 @@ it("cold-restores a suspended provider session under its durable run binding", a
           Buffer.from(String(entry.rawBase64), "base64").toString("utf8"),
         ) as Record<string, unknown>,
     )
-    .filter((frame) => frame.method === "thread/resume");
+    ;
+  const resumeFrames = requestFrames.filter((frame) => frame.method === "thread/resume");
+  for (const frame of requestFrames.filter((f) => ["thread/start", "thread/resume"].includes(String(f.method)))) {
+    expect(frame.params).toMatchObject({ config: { "skills.include_instructions": true } });
+  }
+  const turnFrames = requestFrames.filter((f) => f.method === "turn/start");
+  expect(turnFrames).toHaveLength(2);
+  for (const frame of turnFrames) {
+    expect(frame.params).toMatchObject({ input: expect.arrayContaining([{ type: "skill", name: "assigned", path: join(stateDirectory, "codex-home", "skills", "assigned", "SKILL.md") }]) });
+  }
   expect(resumeFrames.length).toBeGreaterThanOrEqual(1);
   for (const frame of resumeFrames) {
     expect(frame).toEqual(
@@ -8848,3 +8858,38 @@ it("persists an active provider as settled before bounded suspension", async () 
     await rm(stateDirectory, { recursive: true, force: true });
   }
 }, 30_000);
+
+
+it.each(["claude", "codex"] as const)("keeps the explicitly assigned gateway in the %s runner environment", (agent) => {
+  const gateway = {
+    PAPERCLIP_NATIVE_MCP_NAME: "paperclip-assigned",
+    PAPERCLIP_NATIVE_MCP_URL: "http://127.0.0.1:3100/mcp/gateway",
+    PAPERCLIP_NATIVE_MCP_TOKEN: "fixture-scoped-gateway-token-1234567890",
+  };
+  const environment = createCapabilityRunnerdProviderEnvironment({
+    provider: "acpx",
+    options: { provider: "acpx", acpxAgent: agent, environment: {
+      PATH: "/bin", ...gateway, PAPERCLIP_API_KEY: "must-not-cross", DATABASE_URL: "must-not-cross",
+    } },
+    identity: { runnerInstanceId: "runner-1", environmentLeaseId: "lease-1", runId: "run-1",
+      normalizedSessionId: "session-1", turnId: "turn-1", itemId: "item-1" },
+    codexHome: "/isolated/home", runtimeContextPath: "/isolated/context.json", hasRuntimeContext: true,
+    acpxSidecarPath: "/verified/provider-pack/dist/cli/acpx-runtime-sidecar.cjs",
+  });
+  expect(environment).toMatchObject(gateway);
+  expect(environment.PAPERCLIP_API_KEY).toBeUndefined();
+  expect(environment.DATABASE_URL).toBeUndefined();
+});
+
+it("resolves explicit skills to the remote provider home and rejects unassigned paths", () => {
+  const context = assignedRuntimeContext("/controller/bundle", "/controller/instructions");
+  const skill = { type: "skill", name: "assigned", path: "/controller/bundle/SKILL.md" };
+  expect(resolveRunnerdCodexSkillInputs([skill], context, "/runner/codex-home")).toEqual([
+    { type: "skill", name: "assigned", path: "/runner/codex-home/skills/assigned/SKILL.md" },
+  ]);
+  expect(resolveRunnerdCodexSkillInputs([], context, "/runner/codex-home")).toEqual([]);
+  for (const inputs of [[{ ...skill, path: "/arbitrary/SKILL.md" }], [{ ...skill, name: "other" }], [skill, skill]]) {
+    expect(() => resolveRunnerdCodexSkillInputs(inputs, context, "/runner/codex-home")).toThrow("unique assigned runtime skill");
+  }
+  expect(() => resolveRunnerdCodexSkillInputs([skill], null, "/runner/codex-home")).toThrow("assigned runtime skill");
+});

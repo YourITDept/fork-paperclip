@@ -175,6 +175,40 @@ afterEach(async () => {
 });
 
 describe("ACPX runtime host", () => {
+  it.each([
+    { PAPERCLIP_NATIVE_MCP_NAME: "paperclip-assigned" },
+    { PAPERCLIP_NATIVE_MCP_NAME: "paperclip", PAPERCLIP_NATIVE_MCP_URL: "http://127.0.0.1:3211/mcp", PAPERCLIP_NATIVE_MCP_TOKEN: "x".repeat(40) },
+    { PAPERCLIP_NATIVE_MCP_NAME: "paperclip-assigned", PAPERCLIP_NATIVE_MCP_URL: "http://external.example/mcp", PAPERCLIP_NATIVE_MCP_TOKEN: "x".repeat(40) },
+  ])("rejects invalid assigned connection bindings before runtime launch", async (environment) => {
+    const fixture = await hostFixture();
+    const openRuntime = vi.fn();
+    await expect(AcpxRuntimeHost.open({ ...fixture.options, environment }, fixture.dependencies({ openRuntime }))).rejects.toThrow(/assigned native MCP/);
+    expect(openRuntime).not.toHaveBeenCalled();
+  });
+
+  it("registers the assigned connection gateway alongside the Claude task bridge", async () => {
+    const fixture = await hostFixture();
+    let servers: AcpxRuntimePortOpenOptions["mcpServers"] = [];
+    const host = await AcpxRuntimeHost.open({
+      ...fixture.options,
+      agent: "claude", model: "claude-sonnet-5",
+      environment: { ...fixture.options.environment,
+        PAPERCLIP_NATIVE_MCP_NAME: "paperclip-assigned",
+        PAPERCLIP_NATIVE_MCP_URL: "http://127.0.0.1:3211/mcp/gateway",
+        PAPERCLIP_NATIVE_MCP_TOKEN: "fixture-gateway-token-".repeat(3),
+      },
+      semanticTools: { tools: [], handler: async () => ({}) },
+    }, fixture.dependencies({ openRuntime: async (options) => {
+      servers = options.mcpServers;
+      return runtimePort({ getStatus: async () => ({ models: { currentModelId: "claude-sonnet-5" } }) });
+    } }));
+    try {
+      expect(servers.map(server => server.name)).toEqual(["paperclip", "paperclip-assigned"]);
+      expect(servers[1]).toEqual({ name: "paperclip-assigned", url: "http://127.0.0.1:3211/mcp/gateway",
+        bearerToken: "fixture-gateway-token-".repeat(3), runnerOwned: true });
+    } finally { await host.close({ reason: "gateway test complete" }); }
+  });
+
   it("automatically permits only admitted Paperclip reads in the Claude SDK", async () => {
     const fixture = await hostFixture();
     const dependencies = fixture.dependencies({
@@ -242,17 +276,22 @@ describe("ACPX runtime host", () => {
       aggregateDigest: canonicalNativeRuntimeContextDigest(snapshot),
     };
     let skillsHome = "";
+    const providerStartTurn = vi.fn(() => runtimeTurn());
     let assigned = true;
+    let expectedReference = "ASSIGNED_SKILL_MARKER";
     const dependencies = fixture.dependencies({
       openRuntime: async (options) => {
         skillsHome = join(options.launchEnvironment.CLAUDE_CONFIG_DIR!, "skills");
         expect(await readdir(skillsHome)).toEqual(assigned ? ["assigned"] : []);
         if (assigned) {
           const reference = join(skillsHome, "assigned", "references", "answer.txt");
-          expect(await readFile(reference, "utf8")).toBe("ASSIGNED_SKILL_MARKER");
+          expect(await readFile(reference, "utf8")).toBe(expectedReference);
+          expect(await readFile(join(skillsHome, "assigned", "SKILL.md"), "utf8"))
+            .toBe(await readFile(join(skillRoot, "SKILL.md"), "utf8"));
           expect((await stat(reference)).mode & 0o222).toBe(0);
         }
         return runtimePort({
+          startTurn: providerStartTurn,
           getStatus: async () => ({ models: { currentModelId: "claude-sonnet-5" } }),
         });
       },
@@ -270,8 +309,41 @@ describe("ACPX runtime host", () => {
           { ...options, runtimeContext: context },
           dependencies,
         );
+        let message = JSON.stringify({
+          schema: "paperclip.native-model-envelope.v2",
+          task: { description: "Use /assigned", prompt: "A new direct user request" },
+          interactionResponses: index ? [{ response: { status: "accepted" } }] : [],
+        });
+        if (index === 1) {
+          // The provider command is internal overhead, not part of the caller's
+          // 1 MiB allowance. Keep the exact envelope even at that boundary.
+          message += " ".repeat(1024 * 1024 - Buffer.byteLength(message));
+          expect(() => host.startTurn({ text: `${message} `, requestId: "oversized" }))
+            .toThrow("turn text exceeds its bounded size");
+        }
+        host.startTurn({ text: message, requestId: `skill-turn-${index}` });
+        expect(providerStartTurn).toHaveBeenLastCalledWith({
+          text: `/assigned ${message}`, requestId: `skill-turn-${index}`,
+        });
         await host.close({ reason: "reopen test" });
+        // A changed source must replace the prior materialized revision on resume.
+        expectedReference = "UPDATED_ASSIGNED_SKILL_MARKER";
+        await writeFile(join(skillRoot, "references", "answer.txt"), expectedReference);
+        await writeFile(join(skillRoot, "SKILL.md"), "---\nname: assigned\ndescription: Updated instructions.\n---\nRead references/answer.txt before responding.");
       }
+      // The same agent's next ordinary task must not inherit the command.
+      const ordinary = await AcpxRuntimeHost.open(
+        { ...options, runtimeContext: context }, dependencies,
+      );
+      const ordinaryMessage = JSON.stringify({
+        schema: "paperclip.native-model-envelope.v2",
+        task: { description: "An ordinary task", prompt: "Mention /assigned in a note" },
+      });
+      ordinary.startTurn({ text: ordinaryMessage, requestId: "ordinary-task" });
+      expect(providerStartTurn).toHaveBeenLastCalledWith({
+        text: ordinaryMessage, requestId: "ordinary-task",
+      });
+      await ordinary.close({ reason: "ordinary task verified" });
       // No stale assignment survives a later launch without runtime context.
       assigned = false;
       const host = await AcpxRuntimeHost.open(options, dependencies);

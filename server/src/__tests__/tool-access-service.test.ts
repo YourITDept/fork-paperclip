@@ -5099,7 +5099,7 @@ describeEmbeddedPostgres("tool access service", () => {
         "github",
       ]),
     );
-    expect(res.body.apps).toHaveLength(46);
+    expect(res.body.apps).toHaveLength(47);
     expect(
       res.body.apps.find((app: { slug: string }) => app.slug === "gmail")
         .ownershipAvailability,
@@ -13182,6 +13182,39 @@ describeEmbeddedPostgres("tool access service", () => {
     await expect(db.select().from(toolApplications)).resolves.toHaveLength(0);
     await expect(db.select().from(toolConnections)).resolves.toHaveLength(0);
     await expect(db.select().from(toolCatalogEntries)).resolves.toHaveLength(0);
+  });
+
+  it("keeps missing personal authorization as a client-actionable health failure", async () => {
+    const company = await createCompany(db);
+    const service = createTestToolAccessService(db);
+    const { connection } = await createRemoteToolFixture(db, company.id);
+    await db
+      .delete(connectionGrants)
+      .where(eq(connectionGrants.connectionId, connection.id));
+    await db
+      .update(toolConnections)
+      .set({
+        credentialPolicy: "per_user",
+        createdByUserId: "board",
+      })
+      .where(eq(toolConnections.id, connection.id));
+
+    await expect(
+      service.checkHealth(connection.id, {
+        actorType: "user",
+        actorId: "board",
+      }),
+    ).rejects.toMatchObject({
+      status: 422,
+      details: expect.objectContaining({
+        code: "user_authorization_required",
+      }),
+    });
+
+    await expect(service.getConnection(connection.id)).resolves.toMatchObject({
+      healthStatus: "error",
+      healthMessage: "This connection needs the current user's authorization",
+    });
   });
 
   it("reuses and revives an existing application when connecting with applicationId", async () => {
